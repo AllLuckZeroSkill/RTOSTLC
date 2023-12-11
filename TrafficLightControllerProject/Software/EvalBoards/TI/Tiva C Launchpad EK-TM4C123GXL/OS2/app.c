@@ -13,8 +13,10 @@
 #include "driverlib/sysctl.h"
 #include "driverlib/uart.h"
 #include "utils/uartstdio.h"
-#include <time.h>
+//#include <time.h>
 #include <stdlib.h>
+#include "driverlib/interrupt.h"
+#include "inc/tm4c123gh6pm.h"
 /*
 ***************************************************************************************************
 ******
@@ -25,7 +27,7 @@
 #define SYSCTL 0x400FE108
 #define SYSCTL_BASE           0x400FE000
 #define SYSCTL_RCGC2_OFFSET   0x108
-#define SYSCTL_RCGC2_R        (*((volatile uint32_t *)(SYSCTL_BASE + SYSCTL_RCGC2_OFFSET)))
+//#define SYSCTL_RCGC2_R        (*((volatile uint32_t *)(SYSCTL_BASE + SYSCTL_RCGC2_OFFSET)))
 
 #define GPIO_PORTA_BASE      0x40004000
 #define GPIO_PORTA_DATA      (*((volatile uint32_t *)(GPIO_PORTA_BASE + 0x3FC)))
@@ -46,7 +48,16 @@
 #define SENSOR_GPIO_PIN GPIO_PIN_4
 #define LED_GPIO_PORT GPIO_PORTA_BASE
 #define LED_GPIO_PIN GPIO_PIN_3
-#define BLINK_FLAG 1
+#define CAR_FLAG 1
+
+
+
+#define SENSOR_MONITOR_PRIO  5   // Sensor monitor task priority
+#define MAIN_ROAD_SEQ1_PRIO  6   // Main road sequence 1 task priority
+#define MAIN_ROAD_SEQ2_PRIO  10  // Main road sequence 2 task priority
+#define SIDE_ROAD_SEQ1_PRIO  7   // Side road sequence 1 task priority
+#define SIDE_ROAD_SEQ2_PRIO  11  // Side road sequence 2 task priority
+
 /*
 ***************************************************************************************************
 ******
@@ -82,7 +93,10 @@ OS_FLAG_GRP *carDetEvent;
 OS_EVENT *UART_BINARY_SEMAPHORE;
 OS_TCB blinkyTCB;
 volatile bool sensorTriggered = false;
-
+volatile bool runMainRoadSeq2 = false;
+volatile bool runSideRoadSeq2 = false;
+volatile bool sequence2Done = false;
+int trafficTimeCounter;
 /*
 * LOCAL FUNCTION PROTOTYPES
 ***************************************************************************************************
@@ -100,273 +114,160 @@ static void mainRoadLight_seq2(void *p_arg);
 static void sideRoadLight_seq2(void *p_arg);
 
 void Sensor_LEDs_Init(void);
+void Interrupt_Init(void);
+void Sensor_ISR(void);
+void InitConsole(void);
 
-int main (void)
-{
+// Define your GPIO ports and pins here
+#define Red_LED_main GPIO_PIN_6
+#define Green_LED_main GPIO_PIN_3
+#define Yellow_LED_main GPIO_PIN_4
+
+#define Red_LED_side GPIO_PIN_1
+#define Green_LED_side GPIO_PIN_3
+#define Yellow_LED_side GPIO_PIN_1 + GPIO_PIN_3
+
+
+
+int main(void) {
+	int i;
+	int test = 1;
+    // Set up system clock, GPIO, etc
+    SysCtlClockSet(SYSCTL_SYSDIV_5 | SYSCTL_USE_PLL | SYSCTL_OSC_MAIN |
+                   SYSCTL_XTAL_16MHZ);
+		
+    // Initialize sensor and LED GPIOs
+   Sensor_LEDs_Init();
 	
-	#if (OS_TASK_NAME_EN > 0)
-	CPU_INT08U err;
-	#endif
-	#if (CPU_CFG_NAME_EN == DEF_ENABLED)
-	CPU_ERR cpu_err;
-	#endif
-
-	#if (CPU_CFG_NAME_EN == DEF_ENABLED)
-	CPU_NameSet((CPU_CHAR *)"TM4C129XNCZAD",
-	(CPU_ERR *)&cpu_err);
-	#endif
-	CPU_IntDis(); /* Disable all interrupts. */
-	OSInit(); /* Initialize "uC/OS-II, The Real-Time Kernel" */
-	OSTaskCreateExt((void (*)(void *)) AppTaskStart, /* Create the start task
-	*/
-	(void *) 0,
-	(OS_STK *)&AppTaskStartStk[APP_CFG_TASK_START_STK_SIZE - 1],
-	(INT8U ) APP_CFG_TASK_START_PRIO,
-
-	(INT16U ) APP_CFG_TASK_START_PRIO,
-	(OS_STK *)&AppTaskStartStk[0],
-	(INT32U ) APP_CFG_TASK_START_STK_SIZE,
-	(void *) 0,
-	(INT16U )(OS_TASK_OPT_STK_CHK | OS_TASK_OPT_STK_CLR));
-	#if (OS_TASK_NAME_EN > 0)
-	OSTaskNameSet(APP_CFG_TASK_START_PRIO, "Start", &err);
-	#endif
+    // Configure and enable the sensor GPIO pin interrupt
+    Interrupt_Init();
+		
+    // Enable processor interrupts
+    IntMasterEnable();
+		InitConsole();
+	UARTprintf("test message\n");
 	
-		Sensor_LEDs_Init();
-	OSStart(); /* Start multitasking (i.e. give control to uC/OS-II) */
-	for (;;) {
-	}
-}
-static void AppTaskStart (void *p_arg)
-{
-	uint32_t sw2_status;
-
-	CPU_INT32U cpu_clk_freq;
-
-	CPU_INT32U cnts;
-
-	(void)p_arg; /* See Note #1 */
-
-	(void)&p_arg;
-	BSP_Init(); /* Initialize BSP functions */
-	cpu_clk_freq = BSP_SysClkFreqGet(); /* Determine SysTick reference freq.
-	*/
-	cnts = cpu_clk_freq /* Determine nbr SysTick increments */
-	/ (CPU_INT32U)OS_TICKS_PER_SEC;
-	OS_CPU_SysTickInit(cnts);
-	CPU_Init(); /* Initialize the uC/CPU services */
-	#if (OS_TASK_STAT_EN > 0)
-
-	OSStatInit(); /* Determine CPU capacity */
-	#endif
-
-	Mem_Init();
-	#ifdef CPU_CFG_INT_DIS_MEAS_EN
-	CPU_IntDisMeasMaxCurReset();
-	#endif
-
-	BSP_LED_Toggle(0);
-	OSTimeDlyHMSM(0, 0, 0, 200);
-	BSP_LED_Toggle(0);
-	BSP_LED_Toggle(1);
-	OSTimeDlyHMSM(0, 0, 0, 200);
-	BSP_LED_Toggle(1);
-	BSP_LED_Toggle(2);
-	OSTimeDlyHMSM(0, 0, 0, 200);
-	BSP_LED_Toggle(2);
-	OSTimeDlyHMSM(0, 0, 1, 0);
-	AppTaskCreate(); /* Creates all the necessary application tasks.
-
-	*/
-
-	while (DEF_ON) {
-
-		OSTimeDlyHMSM(0, 0, 0, 100);
-
-		// Demonstrating button interface
-		//sw2_status = GPIOPinRead(GPIO_PORTF_BASE, GPIO_PIN_4);
-//		if (sw2_status == 0)
-//		{
-//			UARTprintf("\n\r Button2 was pressed\n\r"); // Probably needs to be protected by semaphore
-
-//		}
-
-	}
-}
-
-/*
-***************************************************************************************************
-******
-* AppTaskCreate()
-*
-* Description : Create the application tasks.
-*
-* Argument(s) : none.
-*
-* Return(s) : none.
-*
-* Caller(s) : AppTaskStart()
-*
-* Note(s) : none.
-***************************************************************************************************
-******
-*/
-static void AppTaskCreate (void)
-{
-	//OSTaskCreate((void (*)(void *)) Task1, /* Create the second task */
-	//(void *) 0, // argument
-	//(OS_STK *)&Task1Stk[APP_CFG_TASK_START_STK_SIZE - 1],
-	//(INT8U ) 5 ); // Task Priority
-
-	//OSTaskCreate((void (*)(void *)) Task2, /* Create the second task */
-	// (void *) 0, // argument
-	// (OS_STK *)&Task2Stk[APP_CFG_TASK_START_STK_SIZE - 1],
-	// (INT8U ) 6 ); // Task Priority
-	INT8U err;
-
-	OSTaskCreate((void 			(*)(void 			*)) sensorMonitor,
- (void 			*) 0, (OS_STK			*)&sensorMonitor2Stk[APP_CFG_TASK_START_STK_SIZE - 1] , (INT8U			 ) 5 );
-	//OSTaskCreate((void (*)(void *)) mainRoadLight_seq1, (void *) 0, (OS_STKmainRoad2Stk[APP_CFG_TASK_START_STK_SIZE - 1] , (INT8U ) 6 );
-	OSTaskCreateExt((void 		(*)(void		 *)) mainRoadLight_seq1,(void 			*) 0,(OS_STK			 *)&mainRoad2Stk[APP_CFG_TASK_START_STK_SIZE - 1],(INT8U 			) 6,
-		(INT16U			 ) 6,(OS_STK 			*)&mainRoad2Stk[0],(INT32U 			)APP_CFG_TASK_START_STK_SIZE,(void *) 0,(INT16U 			)(OS_TASK_OPT_STK_CHK | OS_TASK_OPT_STK_CLR));
-	OSTaskCreate((void			 (*)(void *)) sideRoadLight_seq1, (void 			*) 0, (OS_STK*)&sideRoad2Stk[APP_CFG_TASK_START_STK_SIZE - 1] , (INT8U 			) 7 );
-	// CREATE FLAG 
-	UART_BINARY_SEMAPHORE = OSSemCreate(1);
-	// CREATE SEMAPHOREs
-	carDetEvent = OSFlagCreate(0, &err);
-}
-static void sideRoadLight_seq1(void *p_arg)
-{
-	INT8U err;
-	INT8U blinkyPriority = 6;
-	OS_TCB *p_tcb = &blinkyTCB;
-	
-		for(;;){
-			//OSTimeDlyHMSM(0, 0, 5, 0);
-			UARTprintf("red\n");
-	//		GPIOPinWrite(GPIO_PORTB_BASE, GPIO_PIN_6, GPIO_PIN_6); // Turn on PB6
-			OSTimeDlyHMSM(0, 0, 13, 0);
-	//		GPIOPinWrite(GPIO_PORTB_BASE, GPIO_PIN_6, 0);
-			UARTprintf("green\n");
-	//		GPIOPinWrite(GPIO_PORTA_BASE, GPIO_PIN_3, GPIO_PIN_3); // Turn on PA3
-			OSTimeDlyHMSM(0, 0, 6, 0);
-	//		GPIOPinWrite(GPIO_PORTA_BASE, GPIO_PIN_3, 0);
-UARTprintf("yellow\n");
-	//		GPIOPinWrite(GPIO_PORTA_BASE, GPIO_PIN_4, GPIO_PIN_4); // Turn on PA4
-			OSTimeDlyHMSM(0, 0, 3, 0);
-	//		GPIOPinWrite(GPIO_PORTA_BASE, GPIO_PIN_4, 0);
-
+	while(1){
+    // Sequence 1
+		sequence2Done = false;
+		trafficTimeCounter = 0;
+		
+    while (1) {
+			UARTprintf("dun\n");
+        GPIOPinWrite(GPIO_PORTA_BASE, Green_LED_main, Green_LED_main); // Turn on PA3
+				GPIOPinWrite(GPIO_PORTF_BASE, Red_LED_side, Red_LED_side);
+				for(trafficTimeCounter = 0; trafficTimeCounter<10; trafficTimeCounter++){
+				SysCtlDelay((SysCtlClockGet() / 3) * 1); 
+				if(sequence2Done) break; //Break out of loop and restart sequence 1 from beginning
+			   UARTprintf("%d\n", trafficTimeCounter);
+				}
+				if(sequence2Done) break;
+				GPIOPinWrite(GPIO_PORTA_BASE, Green_LED_main, 0);
+				UARTprintf("2\n");
+				runMainRoadSeq2 = false;
+				runSideRoadSeq2 = false;
+				GPIOPinWrite(GPIO_PORTA_BASE, Yellow_LED_main, Yellow_LED_main); // Turn on PA4
+				SysCtlDelay((SysCtlClockGet() / 3) * 3);   
+				GPIOPinWrite(GPIO_PORTA_BASE, Yellow_LED_main, 0);
+				GPIOPinWrite(GPIO_PORTF_BASE, Red_LED_side, 0);
 			
-			
-			OSTaskQuery(blinkyPriority, &blinkyTCB);
-			
-			OSSemPost(UART_BINARY_SEMAPHORE);
-		}
-}
-
-
-static void sensorMonitor(void *p_arg)
-{
-
-	uint32_t sensor1;
-	uint32_t sensor2;
-	INT8U err;
-	for(;;)
-	{
-		OSTimeDlyHMSM(0, 0, 0, 150);
-		//UARTprintf("hello1");
-		sensor1 = GPIOPinRead(GPIO_PORTB_BASE, GPIO_PIN_4);
-		//UARTprintf("hello2");
-	//	sensor2 = GPIOPinRead(GPIO_PORTF_BASE, GPIO_PIN_4);
-		if(sensor1 == 0 || sensor2 == 0)
-		{
-			//UARTprintf("hello3");
-		OSSemPend(UART_BINARY_SEMAPHORE, 0, &err);
-			if(sensor1 == 0) UARTprintf("Object Detected on Sensor 1:\n");
-			//if(sensor2 == 0) UARTprintf("Object Detected on Sensor 2:\n");
-			OSSemPost(UART_BINARY_SEMAPHORE);
-			OSFlagPost(carDetEvent, BLINK_FLAG, OS_FLAG_SET, &err);
-		}
-	}
-}
-static void mainRoadLight_seq1(void *p_arg)
-{
-	INT8U err;
-	uint32_t newBlinkRate, newColor;
-	for(;;)
-	{
-		OSFlagAccept(carDetEvent, BLINK_FLAG, OS_FLAG_WAIT_SET_ANY + OS_FLAG_CONSUME, &err);
-	
-		if(err == OS_ERR_NONE){
-			
-			
-			
-			
-			OSSemPend(UART_BINARY_SEMAPHORE, 0, &err);
-			
-			OSSemPost(UART_BINARY_SEMAPHORE);
-		}
-
-						GPIOPinWrite(GPIO_PORTA_BASE, GPIO_PIN_3, GPIO_PIN_3); // Turn on PA3
-            OSTimeDlyHMSM(0, 0, 10, 0);
-            GPIOPinWrite(GPIO_PORTA_BASE, GPIO_PIN_3, 0);
-
-            GPIOPinWrite(GPIO_PORTA_BASE, GPIO_PIN_4, GPIO_PIN_4); // Turn on PA4
-            OSTimeDlyHMSM(0, 0, 3, 0);
-            GPIOPinWrite(GPIO_PORTA_BASE, GPIO_PIN_4, 0);
-
-            GPIOPinWrite(GPIO_PORTB_BASE, GPIO_PIN_6, GPIO_PIN_6); // Turn on PB6
-            OSTimeDlyHMSM(0, 0, 9, 0);
-            GPIOPinWrite(GPIO_PORTB_BASE, GPIO_PIN_6, 0);
-	
-	}
-}
-static void Task1 (void *p_arg)
-{
-	(void)p_arg;
-	for(;;) {
-		BSP_LED_Toggle(1);
-
-		UARTprintf("T1 "); // Probably needs to be protected by semaphore
-
-		OSTimeDlyHMSM(0, 0, 0, 400);
-
-	}
-
-}
-static void Task2 (void *p_arg)
-{
-	(void)p_arg;
-	while (1) {
-		BSP_LED_Toggle(2);
-		UARTprintf("T2 "); // Probably needs to be protected by semaphore
-		OSTimeDlyHMSM(0, 0, 0, 700);
-
-	}
-
-}
-
-static void mainRoadLight_seq2(void *p_arg) {
-    while (sensorTriggered) {
-        // Sequence 2 logic for main road
+				
+				GPIOPinWrite(GPIO_PORTB_BASE, Red_LED_main, Red_LED_main); // Turn on PB6
+				GPIOPinWrite(GPIO_PORTF_BASE, Green_LED_side, Green_LED_side);
+				SysCtlDelay((SysCtlClockGet() / 3) * 6);  
+				GPIOPinWrite(GPIO_PORTF_BASE, Green_LED_side, 0);
+				GPIOPinWrite(GPIO_PORTF_BASE, Yellow_LED_side, Yellow_LED_side);
+				SysCtlDelay((SysCtlClockGet() / 3) * 3);
+				GPIOPinWrite(GPIO_PORTB_BASE, Red_LED_main, 0);
+				GPIOPinWrite(GPIO_PORTF_BASE, Yellow_LED_side, 0);
     }
-    // Switch back to sequence 1 or suspend this task
+		UARTprintf("nun\n");
+	}
 }
 
-// Traffic light control task for side road (seq2)
-static void sideRoadLight_seq2(void *p_arg) {
-    while (sensorTriggered) {
-        // Sequence 2 logic for side road
-    }
-    // Switch back to sequence 1 or suspend this task
-}
+// ISR for sensor input
+void Sensor_ISR(void) {
+    // Clear the interrupt (specific to your MCU and library)
+    GPIOIntClear(SENSOR_GPIO_PORT, SENSOR_GPIO_PIN);
+	UARTprintf("int triggered\n");
+		if(GPIOPinRead(GPIO_PORTA_BASE, Green_LED_main) == Green_LED_main){
+			if(!runMainRoadSeq2 && !runSideRoadSeq2 && (trafficTimeCounter > 5)){ //So it doesnt keep triggering
+					runMainRoadSeq2 = true;
+					runSideRoadSeq2 = true;
+				UARTprintf("11\n");
+				//Turn off all LEDs from previous sequence
+				//Main Road
+				GPIOPinWrite(GPIO_PORTA_BASE, Green_LED_main, 0);
+				GPIOPinWrite(GPIO_PORTA_BASE, Yellow_LED_main, 0);
+				GPIOPinWrite(GPIO_PORTB_BASE, Red_LED_main, 0);
+				//Side Road
+				GPIOPinWrite(GPIO_PORTF_BASE, Red_LED_side, 0);
+				GPIOPinWrite(GPIO_PORTF_BASE, Green_LED_side, 0);
+				GPIOPinWrite(GPIO_PORTF_BASE, Yellow_LED_side, 0);
+				
+				//New Sequence
+				GPIOPinWrite(GPIO_PORTF_BASE, Red_LED_side, Red_LED_side);
+				GPIOPinWrite(GPIO_PORTA_BASE, Yellow_LED_main, Yellow_LED_main);
+				SysCtlDelay((SysCtlClockGet() / 3) * 3); 
 
+				GPIOPinWrite(GPIO_PORTF_BASE, Red_LED_side, 0);
+				GPIOPinWrite(GPIO_PORTA_BASE, Yellow_LED_main, 0);
+				GPIOPinWrite(GPIO_PORTF_BASE, Green_LED_side, Green_LED_side);
+				GPIOPinWrite(GPIO_PORTB_BASE, Red_LED_main, Red_LED_main);
+				SysCtlDelay((SysCtlClockGet() / 3) * 6); 
+				
+				GPIOPinWrite(GPIO_PORTF_BASE, Green_LED_side, 0);
+				GPIOPinWrite(GPIO_PORTF_BASE, Yellow_LED_side, Yellow_LED_side);
+				SysCtlDelay((SysCtlClockGet() / 3) * 3);
+				
+				GPIOPinWrite(GPIO_PORTF_BASE, Yellow_LED_side, 0);
+				//GPIOPinWrite(GPIO_PORTF_BASE, Red_LED_side, Red_LED_side);
+				GPIOPinWrite(GPIO_PORTB_BASE, Red_LED_main, 0);
+				
+					
+				sequence2Done = true;
+			}
+			
+		}
+		//UARTprintf("3\n");
+    // Traffic light control logic
+    // Change the state of the LEDs based on the sensor input
+    // ...
+
+    // Example: Toggle a LED
+    
+}
 
 void Sensor_LEDs_Init(void) {
     SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOB);
     SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOA);
+		SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOF);
     GPIOPinTypeGPIOInput(SENSOR_GPIO_PORT, SENSOR_GPIO_PIN);
     GPIOPinTypeGPIOOutput(GPIO_PORTA_BASE, GPIO_PIN_3);
 		GPIOPinTypeGPIOOutput(GPIO_PORTA_BASE, GPIO_PIN_4);
 		GPIOPinTypeGPIOOutput(GPIO_PORTB_BASE, GPIO_PIN_6);
+	
+	//GPIOPinTypeGPIOInput(GPIO_PORTF_BASE, GPIO_PIN_4); //Enable sw1 for input 
+	GPIOPinTypeGPIOOutput(GPIO_PORTF_BASE, GPIO_PIN_3);  //Enable green led for output
+	GPIOPinTypeGPIOOutput(GPIO_PORTF_BASE, GPIO_PIN_2 + GPIO_PIN_3);
+	GPIOPinTypeGPIOOutput(GPIO_PORTF_BASE, GPIO_PIN_1);
+}
+
+void Interrupt_Init(void){
+	
+		GPIOIntDisable(SENSOR_GPIO_PORT, SENSOR_GPIO_PIN);
+    GPIOIntClear(SENSOR_GPIO_PORT, SENSOR_GPIO_PIN);
+    GPIOIntTypeSet(SENSOR_GPIO_PORT, SENSOR_GPIO_PIN, GPIO_RISING_EDGE);
+    GPIOIntEnable(SENSOR_GPIO_PORT, SENSOR_GPIO_PIN);
+		GPIOIntRegister(SENSOR_GPIO_PORT, Sensor_ISR);
+}
+
+void InitConsole(void) {
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOA);
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_UART0);
+    GPIOPinConfigure(GPIO_PA0_U0RX);
+    GPIOPinConfigure(GPIO_PA1_U0TX);
+    GPIOPinTypeUART(GPIO_PORTA_BASE, GPIO_PIN_0 | GPIO_PIN_1);
+    UARTClockSourceSet(UART0_BASE, UART_CLOCK_PIOSC);
+    UARTStdioConfig(0, 9600, 16000000);
 }
